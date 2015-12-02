@@ -1,20 +1,59 @@
 #!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#    Dieses Programm ist Freie Software: Sie können es unter den Bedingungen
+#    der GNU General Public License, wie von der Free Software Foundation,
+#    Version 3 der Lizenz oder (nach Ihrer Wahl) jeder neueren
+#    veröffentlichten Version, weiterverbreiten und/oder modifizieren.
+#
+#    Dieses Programm wird in der Hoffnung, dass es nützlich sein wird, aber
+#    OHNE JEDE GEWÄHRLEISTUNG, bereitgestellt; sogar ohne die implizite
+#    Gewährleistung der MARKTFÄHIGKEIT oder EIGNUNG FÜR EINEN BESTIMMTEN ZWECK.
+#    Siehe die GNU General Public License für weitere Details.
+#
+#    Sie sollten eine Kopie der GNU General Public License zusammen mit diesem
+#    Programm erhalten haben. Wenn nicht, siehe <http://www.gnu.org/licenses/>.
 
 import apt
 import apt_pkg
 import sys
 import os
-sys.path.append(os.path.join(os.environ["HOME"], "scripts/python/installsystem"))
-import libinstall
 from collections import deque
 import signal
 import tempfile
-sys.path.append(os.path.join(os.environ["HOME"], "scripts/python/lib"))
-import check_os
-import pm_utils
+import python_essentials
+import python_essentials.lib
+import python_essentials.lib.check_os as check_os
+import python_essentials.lib.pm_utils as pm_utils
 import subprocess as sp
 
-# In order to provide a reinstall possibility, the script doesn't to work with the apt_pkg.Cache class because function call dependencies are badly documented. Instead apt.Cache is used and the reinstallation is done using os.system
+# Tries to install a set of apt packages (initially all installed packages) and
+# continues trying with a subset in case the installation fails (assuming it
+# failed to a dependency cycle which often occur during installation of large
+# sets of packages). This number of subsets in which a failing (sub)set is split
+# isn't configurable on the command line yet.
+#
+# In case a subset fails due to an error which doesn't require the (sub)set to
+# be split (e.g. a download error) it will be split nevertheless because that
+# doesn't hurt and keeps the script simple.
+#
+# In order to provide a reinstall possibility, the script doesn't to work with
+# the apt_pkg.Cache class because function call dependencies are badly
+# documented. Instead apt.Cache is used and the reinstallation is done using
+# os.system.
 
 def reinstall_all_apt_packages(skip_apt_update=False):
     if not check_os.check_root():
@@ -39,10 +78,12 @@ def reinstall_all_apt_packages(skip_apt_update=False):
     count_done = install_binary(cache_installed, skip_apt_update=skip_apt_update)
     print("installed "+str(essential_count_done+count_done)+" of "+str(essential_count+count)+" packages")
 
-# logs output of apt-get to a tempfile whose path is printed to console in order to make error output more visible
-# @return the number of installed packages
-# @args split_count #packages % split_count is installed one by one
 def install_binary(packages, skip_apt_update=False, split_count=4):
+    """
+    logs output of apt-get to a tempfile whose path is printed to console in order to make error output more visible
+    @return the number of installed packages
+    @args split_count #packages % split_count are installed one by one
+    """
     if len(packages) <= 1:
         raise ValueError("packages has to be at least 2 items long")
     log_file = tempfile.mkstemp() # a tuple of fd and path as string
