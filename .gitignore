@@ -1,0 +1,3 @@
+build/
+dist/
+reinstall_all_apt_packages.egg-info/
