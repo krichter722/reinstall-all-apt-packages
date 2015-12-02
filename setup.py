@@ -33,8 +33,8 @@ import conf_home_globals
 
 setup(
     name = "reinstall-all-apt-packages",
-    version = "1.0",
+    version_command = ("git describe --tags", "pep440-git-local"),
     packages = ["."],
-    install_requires = ["python-essentials", ],
+    install_requires = ["python-essentials", "plac"],
 )
 

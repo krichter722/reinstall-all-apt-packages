@@ -39,6 +39,15 @@ import python_essentials.lib
 import python_essentials.lib.check_os as check_os
 import python_essentials.lib.pm_utils as pm_utils
 import subprocess as sp
+import plac
+import logging
+import threading
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger_stdout_handler = logging.StreamHandler()
+logger_stdout_handler.setLevel(logging.INFO)
+logger.addHandler(logger_stdout_handler)
 
 # Tries to install a set of apt packages (initially all installed packages) and
 # continues trying with a subset in case the installation fails (assuming it
@@ -55,7 +64,10 @@ import subprocess as sp
 # documented. Instead apt.Cache is used and the reinstallation is done using
 # os.system.
 
-def reinstall_all_apt_packages(skip_apt_update=False):
+@plac.annotations(skip_apt_update=("Allows skipping `apt-get update` e.g. if you just run it or don't have an internet connection", "flag"),
+    assume_yes=("Uses the `--assume-yes` flag of `apt-get` in order to avoid question during the reinstallation process which are blocking the progress until user input is given", "flag"),
+)
+def reinstall_all_apt_packages(skip_apt_update=False, assume_yes=False):
     if not check_os.check_root():
         raise RuntimeError("You're not root")
     apt_pkg.init()
@@ -70,15 +82,15 @@ def reinstall_all_apt_packages(skip_apt_update=False):
                 cache_installed.append(cache_entry.name)
     
     essential_count = len(cache_installed_essential)
-    print("installing "+str(essential_count)+" essential packages")
+    logger.info("installing "+str(essential_count)+" essential packages")
     essential_count_done = install_binary(cache_installed_essential, skip_apt_update=skip_apt_update)
 
     count = len(cache_installed)
-    print("installing "+str(count)+" remaining packages")
-    count_done = install_binary(cache_installed, skip_apt_update=skip_apt_update)
-    print("installed "+str(essential_count_done+count_done)+" of "+str(essential_count+count)+" packages")
+    logger.info("installing "+str(count)+" remaining packages")
+    count_done = install_binary(cache_installed, skip_apt_update=skip_apt_update, assume_yes=assume_yes)
+    logger.info("installed "+str(essential_count_done+count_done)+" of "+str(essential_count+count)+" packages")
 
-def install_binary(packages, skip_apt_update=False, split_count=4):
+def install_binary(packages, skip_apt_update=False, assume_yes=False, split_count=4):
     """
     logs output of apt-get to a tempfile whose path is printed to console in order to make error output more visible
     @return the number of installed packages
@@ -86,48 +98,79 @@ def install_binary(packages, skip_apt_update=False, split_count=4):
     """
     if len(packages) <= 1:
         raise ValueError("packages has to be at least 2 items long")
-    log_file = tempfile.mkstemp() # a tuple of fd and path as string
-    print("logging to %s (use 'tail -f %s' to follow the output)" % (log_file, log_file))
+    log_file, log_file_path = tempfile.mkstemp() # a tuple of fd and path as string
+    logger.info("logging to %s (use 'tail -f %s' to follow the output)" % (log_file_path, log_file_path))
     count = 0
+    failed_packages = [] # a list of failed packages (failed twice even after `apt-get install -f`) and will be reported at the end
     packages0 = list()
     for i in packages:
         packages0.append(i)
     # interval_queue is a queue of tuples of {begins} x {ends} x {packages}
     interval_queue = deque()
     interval_queue.append((0, len(packages0), packages0))
+    # catch SIGINT when it's sent the first time, but forward it the second
+    sigint_sent = threading.Lock() # needs to be an object (not necessary a Lock, but that's the first availble object that comes to mind)
+    def handler(signum, frame):
+        logger.debug("signal handler called with signal %d" % (signum, ))
+        if not sigint_sent.locked():
+            sigint_sent.acquire()
+            logger.info("""
+            ################################################################################
+            # Eventullay waiting for apt-get command to return. Send signal SIGINT again   #
+            # to force interrupt.")                                                        #
+            ################################################################################
+            """)
+        else:
+            raise Exception("Interruption forced with second signal SIGINT")
+    signal.signal(signal.SIGINT, handler)
     while not len(interval_queue) == 0:
         current_interval = interval_queue.popleft()
         current_begin = current_interval[0]
         current_end = current_interval[1]
         current_packages = current_interval[2]
-        print("installing interval "+str(current_begin)+" to "+str(current_end))
+        logger.info("installing interval "+str(current_begin)+" to "+str(current_end))
         failed = False
         try:
-            try:
-                pm_utils.reinstall_packages(list(current_packages), "apt-get", True, skip_apt_update=skip_apt_update,stdout=log_file[0])
-            except sp.CalledProcessError:
-                failed=True
-        except KeyboardInterrupt:
+            pm_utils.reinstall_packages(list(current_packages), "apt-get", assume_yes=assume_yes, skip_apt_update=skip_apt_update, stdout=log_file)
+        except sp.CalledProcessError:
+            failed=True
+        if sigint_sent.locked():
             break
         current_packages_length = len(current_packages)
         if failed:
-            current_packages_length_rest = current_packages_length % split_count
-            current_packages_length_full = current_packages_length - current_packages_length_rest
-            for split_index in range(0,split_count):
-                new_begin = int(current_begin+split_index*current_packages_length_full/split_count)
-                new_end = int(new_begin+current_packages_length_full/split_count)
-                new_packages_begin = int(split_index*current_packages_length_full/split_count)
-                new_packages_end = int(new_packages_begin+current_packages_length_full/split_count)
-                new_packages = current_packages[new_packages_begin:new_packages_end]
-                interval_queue.append((new_begin, new_end, new_packages)) # end is exclusive
-            # rest
-            current_packages_rest = current_packages[current_packages_length_full:]
-            for package_index in range(0, current_packages_length_rest):
-                interval_queue.append((current_packages_length_full+package_index, current_packages_length_full+package_index, current_packages_rest[package_index:package_index+1]))
+            if current_packages_length == 0:
+                # if there's only one package failing we might get in a loop -> handle separately here (try to install once more and leave it failed because there's nothing we can do)
+                sp.call(["apt-get", "install", "-f"]) # try to fix missing dependencies
+                try:
+                    pm_utils.reinstall_packages(list(current_packages), "apt-get", True, skip_apt_update=skip_apt_update, assume_yes=assume_yes, stdout=log_file)
+                except sp.CalledProcessError:
+                    logger.warn("installation of %s failed" % (str(current_packages),)) # both report after failure and sum up at the end because output is quite cluttered
+                    failed_packages += current_packages
+            else:
+                current_packages_length_rest = current_packages_length % split_count
+                current_packages_length_full = current_packages_length - current_packages_length_rest
+                # splitting in packages modulo split_count
+                for split_index in range(0,split_count):
+                    new_begin = int(current_begin+split_index*current_packages_length_full/split_count)
+                    new_end = int(new_begin+current_packages_length_full/split_count)
+                    new_packages_begin = int(split_index*current_packages_length_full/split_count)
+                    new_packages_end = int(new_packages_begin+current_packages_length_full/split_count)
+                    new_packages = current_packages[new_packages_begin:new_packages_end]
+                    interval_queue.append((new_begin, new_end, new_packages)) # end is exclusive
+                # adding the rest (of modulo splitting)
+                current_packages_rest = current_packages[current_packages_length_full:]
+                for package_index in range(0, current_packages_length_rest):
+                    interval_queue.append((current_packages_length_full+package_index, current_packages_length_full+package_index, current_packages_rest[package_index:package_index+1]))
         else:
             count += current_packages_length
+    if len(failed_packages) > 0:
+        logger.warn("installation of the following packages failed: %s" % (failed,))
     return count
 
+def main():
+    """main function for setuptools entry_points"""
+    plac.call(reinstall_all_apt_packages)
+
 if __name__ == "__main__":
-    reinstall_all_apt_packages()
+    main()
 
